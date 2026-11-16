@@ -1,85 +1,108 @@
-from __future__ import annotations
-
+import json
 import os
-from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 import streamlit as st
-from dotenv import load_dotenv
 
-from utils import generate_scenes, generate_images, create_slideshow
+from utils import script_gen, media_gen, video_editor
 
-load_dotenv()
-
-
-def _get_assets_root() -> Path:
-    """환경 변수 또는 기본값으로 자산 루트 디렉터리 결정."""
-    root = os.getenv("ASSETS_DIR", "assets")
-    return Path(root)
+WORKFLOW_T2I = Path("workflow_t2i.json")
+WORKFLOW_I2V = Path("workflow_i2v.json")
+FINAL_OUTPUT = Path("outputs/final_movie.mp4")
 
 
-def _new_run_directory() -> Path:
-    """실행 시점별 폴더 생성."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = _get_assets_root() / ts
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
+def log(message: str):
+    """로그 리스트에 추가하고 UI 갱신."""
+    st.session_state.logs.append(message)
+    st.session_state.log_area.text("\n".join(st.session_state.logs))
 
 
-def _has_env_keys() -> bool:
-    """필수 키 존재 여부 검사."""
-    return bool(os.getenv("GOOGLE_API_KEY") and os.getenv("HF_TOKEN"))
+def ensure_state():
+    """세션 상태 기본값을 준비."""
+    defaults = {
+        "keyword": "",
+        "scenes": [],
+        "image_paths": [],
+        "video_paths": [],
+        "logs": [],
+    }
+    for k, v in defaults.items():
+        st.session_state.setdefault(k, v)
 
 
-def main() -> None:
-    st.set_page_config(page_title="YouTube Shorts Factory", layout="wide")
-    st.title("🎬 YouTube Shorts Factory")
-    st.caption("주제만 넣으면 스크립트 → 이미지 → 영상까지 자동화")
+def main():
+    st.set_page_config(page_title="로컬 AI 쇼츠 제너레이터", layout="wide")
+    ensure_state()
 
-    topic = st.text_input("주제(Topic)를 입력하세요", placeholder="예: 7 Deadly Sins as Cats")
-    run_button = st.button("생성 시작", type="primary")
+    st.title("로컬 AI 쇼츠 제너레이터 (ComfyUI + Gemini)")
 
-    if run_button:
-        if not _has_env_keys():
-            st.error("GOOGLE_API_KEY 와 HF_TOKEN 을 .env에 설정해주세요.")
-            return
+    with st.sidebar:
+        st.markdown("### 설정")
+        api_key = st.text_input("Gemini API Key", type="password")
+        st.session_state.keyword = st.text_input("프로젝트 주제 (한글 키워드)", value=st.session_state.keyword)
+        generate_script_btn = st.button("스크립트 생성")
+        generate_images_btn = st.button("이미지 생성 (로컬)")
+        generate_videos_btn = st.button("영상 생성 (로컬)")
+        render_btn = st.button("최종 영상 렌더")
 
-        if not topic.strip():
-            st.warning("주제를 입력해주세요.")
-            return
+    st.session_state.log_area = st.empty()
+    log("대기 중입니다.")
 
-        st.info("1) Gemini로 스크립트 생성 중...")
-        scenes, err = generate_scenes(topic)
-        if err:
-            st.error(f"스크립트를 생성하지 못했습니다: {err}")
-            return
-
-        st.success(f"장면 {len(scenes)}개 생성 완료")
-        run_dir = _new_run_directory()
-        image_dir = run_dir / "images"
-        video_path = run_dir / "video.mp4"
-
-        st.info("2) SDXL로 이미지 생성 중...")
-        image_paths = generate_images(scenes, image_dir)
-        if not image_paths:
-            st.error("이미지 생성에 실패했습니다. Hugging Face 토큰을 확인하거나 재시도하세요.")
-            return
-
-        st.success(f"이미지 {len(image_paths)}개 생성 완료 → {image_dir}")
-
-        st.info("3) MoviePy로 영상 합성 중...")
-        subtitles: List[str] = [scene.get("voiceover", "") for scene in scenes][: len(image_paths)]
+    if generate_script_btn:
         try:
-            output = create_slideshow(image_paths, subtitles, video_path)
-            st.video(str(output))
-            st.success(f"영상 생성 완료: {output}")
-        except Exception as exc:
-            st.error(f"영상 합성 중 오류가 발생했습니다: {exc}")
+            log("Gemini에 스크립트를 요청 중...")
+            scenes = script_gen.generate_scenes(st.session_state.keyword, api_key=api_key)
+            st.session_state.scenes = scenes
+            log(f"{len(scenes)}개의 씬을 수신했습니다.")
+        except Exception as e:
+            log(f"스크립트 생성 실패: {e}")
+
+    if generate_images_btn:
+        if not st.session_state.scenes:
+            log("씬 정보가 없습니다. 먼저 스크립트를 생성하세요.")
+        else:
+            try:
+                log("ComfyUI를 통해 이미지를 생성 중...")
+                images = media_gen.generate_images_local(st.session_state.scenes, WORKFLOW_T2I)
+                st.session_state.image_paths = images
+                log(f"{len(images)}개의 이미지를 생성했습니다.")
+            except Exception as e:
+                log(f"이미지 생성 실패: {e}")
+
+    if generate_videos_btn:
+        if not st.session_state.image_paths:
+            log("이미지 경로가 없습니다. 먼저 이미지를 생성하세요.")
+        else:
+            try:
+                log("ComfyUI(SVD)로 영상을 생성 중...")
+                videos = media_gen.generate_videos_local(st.session_state.image_paths, WORKFLOW_I2V)
+                st.session_state.video_paths = videos
+                log(f"{len(videos)}개의 영상을 생성했습니다.")
+            except Exception as e:
+                log(f"영상 생성 실패: {e}")
+
+    if render_btn:
+        if not st.session_state.video_paths:
+            log("영상 클립이 없습니다. 먼저 영상을 생성하세요.")
+        else:
+            try:
+                log("자막을 입혀 최종 영상을 렌더링 중...")
+                video_editor.assemble_video_with_subtitles(
+                    st.session_state.video_paths, st.session_state.scenes, FINAL_OUTPUT
+                )
+                log(f"렌더 완료: {FINAL_OUTPUT}")
+            except Exception as e:
+                log(f"렌더 실패: {e}")
+
+    if st.session_state.scenes:
+        st.markdown("### 씬 목록")
+        for idx, scene in enumerate(st.session_state.scenes, start=1):
+            st.markdown(f"**씬 {idx}**")
+            st.markdown(f"- 내레이션: {scene.get('voiceover', '')}")
+            st.markdown(f"- 프롬프트: {scene.get('image_prompt', '')}")
 
 
 if __name__ == "__main__":
     main()
-
-
 
